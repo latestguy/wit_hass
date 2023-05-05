@@ -5,6 +5,7 @@ import urllib.request
 import webbrowser
 from io import BytesIO
 from threading import Thread
+from websockets.sync.client import connect
 
 import cairosvg
 import pyzbar.pyzbar as pyzbar
@@ -16,6 +17,7 @@ from werkzeug.serving import make_server
 
 
 from train_list import FINAL_TRAIN, TRAIN_SWITCH, TRAIN_LIGHT
+from wit import Wit
 
 app = Flask(__name__)
 server = None
@@ -28,172 +30,8 @@ token_url = 'http://localhost:8123/auth/token'
 
 refresh_token: str = None
 access_token: str = None
+lla_token: str = None
 server_thread: Thread = None
-
-
-class Wit():
-    "Wit api class."
-
-    def __init__(self, token: str) -> None:
-        self.__token = token
-
-        self.__headers = {
-            "Authorization": f"Bearer {self.__token}",
-            "Content-Type": "application/json",
-        }
-
-    def add_intent(self, intent: str) -> bool:
-        "add a intent for wit"
-
-        intent_api = "https://api.wit.ai/intents"
-        data = json.dumps({
-            "name": intent,
-        })
-
-        response = requests.post(intent_api, headers=self.__headers, data=data)
-        if response.status_code == 200:
-            print(f"intent {intent} already registerd!")
-            return True
-        elif response.status_code == 400:
-            if "already exists" in response.json()['error']:
-                print(f"{response.json()['error']}, skip")
-                return True
-            else:
-                print(f"{response.json()}")
-                return False
-        else:
-            print(f"{response.json()}")
-            return False
-
-    def add_entity(self, entity_data: dict) -> bool:
-        """add an entity for wit"""
-
-        entity_url = "https://api.wit.ai/entities?v=20230310"
-
-        # print(f'{entity_data}')
-
-        response = requests.post(url=entity_url, headers=self.__headers, json=entity_data)
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 400:
-            if "already-exists" in response.json()['code']:
-                print(f"{response.json()['error']}, skip")
-                return True
-        else:
-            print(f"{response.json()}")
-            return False
-        
-    def add_entity_keyword(self, name: str, keyword_data: dict) -> bool:
-        """add an entity for wit"""
-
-        keyword_url = "https://api.wit.ai/entities/"+name+"/keywords"
-
-        # print(f'{keyword_data}')
-
-        response = requests.post(url=keyword_url, headers=self.__headers, json=keyword_data)
-        # print(f"resp: {response.text}")
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 400:
-            if "already exists" in response.json()['error']:
-                print(f"{response.json()['error']}, skip")
-                return True
-        else:
-            print(f"{response.json()}")
-            return False
-
-    def add_trait(self, trait: str) -> bool:
-        """add a trait for wit."""
-        
-        trait_url = "https://api.wit.ai/traits"
-
-        data = {
-            "name": trait,
-            "values": ["on", "off"]
-        }
-
-        response = requests.post(url=trait_url, headers=self.__headers, json=data)
-        if response.status_code == 200:
-            print(f"{trait} register success!")
-            return True
-        elif response.status_code == 400:
-            if "already-exists" in response.json()['code']:
-                print(f"{response.json()['error']}, skip")
-                return True
-        else:
-            print(f"{response.json()}")
-            return False
-
-
-    def add_utterance(self, utterance: dict):
-        """add an utterance for wit."""
-
-        ut_url = "https://api.wit.ai/utterances"
-        data = json.dumps(utterance)
-
-        response = requests.post(url=ut_url, headers=self.__headers, data=data)
-        if response.status_code == 200:
-            print(f"\"{utterance[0]['text']}\" register success!")
-            return True
-        elif response.status_code == 400:
-            if "already-exists" in response.json()['code']:
-                print(f"utterance: {response.json()['error']}, skip")
-                return True
-        else:
-            print(f"{response.json()}")
-            return False
-
-    def pack_utterance_data(self, name: str, type: str, prefix: str):
-        """pack utterance data for self.add_utterance"""
-
-        # name = 'hello 3'
-        # type = 'switch'
-        text = f"{prefix} {name} {type}"
-        body = f"{type}.{name}".replace(' ', '_')
-        print(f'train text: {text}')
-        # print(f'body: {body}')
-        ut_1: list = [{
-            "text": text,
-            "intent": "on_off",
-            "entities": [
-                {
-                    "entity": "ha_dev:ha_dev",  # map for entity Role in wit web
-                    "start": text.index(name),
-                    "end": text.index(name) + len(name),
-                    "body": body,               # map for entity Resolved value in wit web
-                    "entities": []
-                },
-                {
-                    "entity": "ha_type:ha_type",
-                    "start": text.index(type),
-                    "end": text.index(type) + len(type),
-                    "body": type,
-                    "entities": []
-                }
-            ],
-            "traits": [
-                {
-                    "trait": "wit$on_off",
-                    "value": "off"
-                }
-            ]
-        }]
-
-        return ut_1
-    
-    def message(self, user_input: str) -> dict:
-        """handle the utterance which user input."""
-        # eg. Turn off hello 1 switch
-        ut_url = "https://api.wit.ai/message"
-        params = {
-            'q': user_input,
-        }
-
-        response = requests.get(url=ut_url, headers=self.__headers, params=params)
-        # print(f'response: {response.text}')
-        if response.status_code == 200:
-            return response.json()
-
 
 @app.route('/')
 def index():
@@ -205,6 +43,7 @@ def index():
 def auth_callback():
     global refresh_token
     global access_token
+    global lla_token
     code = request.args.get('code')
     response = requests.post(token_url, data={
         'grant_type': 'authorization_code', 
@@ -214,10 +53,12 @@ def auth_callback():
     print(f'{response.text}')
     access_token = response.json()['access_token']
     refresh_token = response.json()['refresh_token']
+    lla_token = gen_lla_token()
     with open(ha_token_file, "w") as f:
         tk_data = {
             "access_token": access_token,
-            "refresh_token": refresh_token
+            "refresh_token": refresh_token,
+            "lla_token": lla_token
         }
         json.dump(tk_data, f)
 
@@ -233,38 +74,85 @@ def auth_callback():
     """
 
 def check_ha_token() -> bool:
-    """Check homeassistant refresh token if valid."""
+    """Check homeassistant lla and access token if valid."""
 
-    global access_token
+    global access_token, lla_token
 
     try:
         with open(ha_token_file, "r") as f:
             data = json.load(f)
-            access_token = data["access_token"]
-            # print(f'token: {data}')
+            access_token = data.get("access_token", None)
+            lla_token = data.get("lla_token", None)
+    except json.decoder.JSONDecodeError as err:
+        print(f"parse ha_token json data failed! start go to web auth")
+        return False
     except FileNotFoundError as err:
         print(f'open {ha_token_file} failed! start go to web auth')
         return False
 
-    if access_token is not None:
-        api_url = 'http://localhost:8123/api/'
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-        resp = requests.get(url=api_url, headers=headers)
-        if resp.status_code == 200:
-            # refresh token is valid
-            print(f'refresh token is valid')
-            return True
-        else:
-            # refresh token is invalid, need to regenerator
-            print(f'refresh token is Invalid')
-            # print(f'{resp.status_code, resp.text}')
-            return False
+    if lla_token is not None:
+        token = lla_token
+    elif access_token is not None:
+        token = access_token
     else:
-        print(f"have no refresh token!")
+        print(f"have no lla and access token!")
         return False
+
+    api_url = 'http://localhost:8123/api/'
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    resp = requests.get(url=api_url, headers=headers)
+    if resp.status_code == 200:
+        # token is valid
+        print(f'token is valid')
+        return True
+    else:
+        # token is invalid, need to regenerator
+        print(f'token is Invalid')
+        # print(f'{resp.status_code, resp.text}')
+        return False
+
+def gen_lla_token() -> str:
+    global access_token
+
+    # 1.Client connects
+    with connect("ws://localhost:8123/api/websocket") as websocket:
+        resp = websocket.recv()
+        # # 2.Authentication phase
+        if "auth_required" != json.loads(resp).get("type", None):
+            print(f"Ha ws msg have no \"auth_required\"!")
+            return None
+
+        # 2.1 sends auth message
+        auth_msg = json.dumps({
+            "type": "auth",
+            "access_token": access_token
+        })
+        websocket.send(auth_msg)
+        resp = websocket.recv()
+        if "auth_ok" != json.loads(resp).get("type", None):
+            print(f"Ha ws msg have no \"auth_ok\"!")
+            return None
+        print(f"ha resp auth status: {resp}")
+
+        lla_msg = json.dumps({
+            "id": 11,
+            "type": "auth/long_lived_access_token",
+            "client_name": "Loona",
+            # "client_icon": null,
+            "lifespan": 365
+        })
+        websocket.send(lla_msg)
+        resp = websocket.recv()
+        if json.loads(resp).get("success", False) is True:
+            print(f"True ha resp lla token: {resp}")
+            return json.loads(resp).get("result")
+        else:
+            print(f"Ha ws generate Long-Lived Access Token failed!")
+            return None
+
 
 def start_ha_server():
     '''Create and start flask web for homeassistant auth.'''
@@ -282,11 +170,6 @@ def ha_2_wit_train(wit: Wit, ha_data: dict = None, train_data: dict = None) -> b
         return False
     if not train_data:
         return False
-
-    # for type in ha_data:
-    #     print(f"type: {type}")
-    # for list in train_data:
-    #     print(f"{list}")
 
     """1. add intent on_off for switch dev type """
     print(f"==========Add Intent==========")
@@ -343,7 +226,7 @@ def loona_paring_qr() -> bool:
     """Decode loona paring qr code."""
     api_url = 'http://localhost:8123/api/loona/pairingqr'
     headers = {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {lla_token}",
         "Content-Type": "image/svg+xml"
     }
     req = urllib.request.Request(api_url, headers=headers)
@@ -359,7 +242,7 @@ def loona_paring_qr() -> bool:
         png_data = cairosvg.svg2png(bytestring=svg_data)
         image = Image.open(BytesIO(png_data))
     except urllib.error.URLError as e:
-        print(f"response is None")
+        print(f"qrcode response is None, please add eneities in Loona intergration first!")
         return None
 
     # 解析二维码中的数据
@@ -382,15 +265,14 @@ def do_control(wit_resp: dict):
         entity_id: str = entity[0]["value"]
         action: str = trait["value"]
         type: str = wit_resp["entities"]["ha_type:ha_type"][0]["body"]
-        print(f'{entity_id}')
+        print(f'to control entity_id: {entity_id}')
 
         serv_api_base = f'http://localhost:8123/api/services/'
         data = {
             "entity_id": entity_id
         }
-        print(f'access_token = {access_token}')
         headers = {
-            "Authorization": f"Bearer {access_token}",
+            "Authorization": f"Bearer {lla_token}",
             "Content-Type": "application/json"
         }
         if action in "turn_on":
@@ -405,6 +287,7 @@ if __name__ == '__main__':
     print(f'hello world!')
 
     if not check_ha_token():
+        # token is invalid, open web tab to login
         server_thread = Thread(target=start_ha_server)
         server_thread.start()
         webbrowser.open('http://127.0.0.1:5000', new=2)
