@@ -166,9 +166,7 @@ def start_ha_server():
 def ha_2_wit_train(wit: Wit, ha_data: dict = None, train_data: dict = None) -> bool:
     """Train wit utterance with homeassistant entity id and type."""
 
-    if not ha_data:
-        return False
-    if not train_data:
+    if ha_data is None or train_data is None:
         return False
 
     """1. add intent on_off for switch dev type """
